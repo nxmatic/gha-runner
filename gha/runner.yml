@@ -1,0 +1,38 @@
+services:
+
+  runner:
+    cap_add:
+      - SETGID
+      - CAP_AUDIT_WRITE
+    depends_on:
+      - gha-kms
+    environment:
+      DOCKER_HOST: 'tcp://host.containers.internal:2375'
+      RUNNER_GOPROXY: 'http://goproxy.knat.network,https://proxy.golang.org,direct'
+      RUNNER_LABELS: 'docker'
+      RUNNER_INTERNAL_DNS_DOMAIN: '${INTERNAL_DNS_DOMAIN}'
+      RUNNER_NAME: '${USER}'
+      RUNNER_OWNER: '${RUNNER_OWNER:-nuxeo}'
+      RUNNER_PROJECT_NAME: '${PROJECT_NAME}'
+      RUNNER_REGISTER_TO: '${GITHUB_REPOSITORY:-${RUNNER_OWNER:-nuxeo}/nos}'
+      RUNNER_WORKDIR: 'work'
+      RUNNER_GIT_WORKTREE: '${GIT_WORKTREE}'
+#     RUNNER_ADDITIONAL_FLAGS: '--ephemeral'
+    # healthcheck:
+    #   test: ["CMD", "/bin/bash", "-c", "/usr/local/sbin/check-resolved"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 40s
+    image: ${DOWNSTREAM:-ghcr.io/nuxeo/nos}/gha-runner:${VERSION:-latest}
+    networks:
+      - gha
+      - nuxeo
+    pids_limit: -1
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - gha-work:/home/runner/work
+      - m2-repository:/home/runner/.m2/repository
+      - m2-build-cache:/home/runner/.m2/build-cache
+      - ${GIT_WORKTREE}:${GIT_WORKTREE}

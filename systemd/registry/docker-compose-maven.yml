@@ -1,0 +1,6 @@
+
+name: docker-registry
+
+include:
+  - docker-compose~ssl-proxy.yml
+  - docker-compose~server.yml

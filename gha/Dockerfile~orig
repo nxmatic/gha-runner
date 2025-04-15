@@ -1,0 +1,770 @@
+ARG NODE_VERSION=22.3.0-alpine3.19 #16.13.1-alpine3.14
+ARG UBUNTU_VERSION=noble # 24.04 (mantic - 23.10)
+
+FROM node:${NODE_VERSION} as kms-builder
+
+WORKDIR /app
+
+COPY --link /kms/package*.json ./
+
+RUN npm ci
+
+FROM node:${NODE_VERSION} as kms
+
+WORKDIR /app
+
+COPY --link --from=kms-builder /app ./
+
+COPY --link /kms/index.js /kms/config.json ./
+
+EXPOSE 3000
+
+CMD ["node","index.js"]
+
+FROM jrei/systemd-ubuntu:${UBUNTU_VERSION} as env
+
+ARG GITHUB_RUNNER_VERSION=latest
+ARG DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /runner
+
+RUN <<~
+    : install required cli
+    apt-get -y update
+    apt-get -y install      \
+      bash                  \
+      git gh jq             \
+      curl ca-certificates
+~
+
+SHELL [ "/usr/bin/env", "-S", "bash", "-ex", "-o", "pipefail", "-c" ]
+ENV PS4="+ "
+
+RUN --mount=type=secret,id=GITHUB_TOKEN <<~
+    : fetch runtime from github release
+    gh:arch() {
+      case $(uname -m) in
+        aarch64) echo "arm64";;
+        x86_64) echo "x64";;
+        *) echo "cannot map arch" && exit 1;;
+      esac
+    }
+    trap "rm -f /tmp/runner.tgz" EXIT
+    export GH_TOKEN=$(cat /run/secrets/GITHUB_TOKEN)
+    gh extension install chmouel/gh-get-asset
+    gh get-asset -s -o /tmp/runner.tgz actions/runner linux-$( gh:arch )
+    gunzip - < /tmp/runner.tgz |
+      tar xf -
+~
+
+FROM jrei/systemd-ubuntu:${UBUNTU_VERSION} as runner-os
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GATEWAY=10.89.1.1
+
+ENV RUNNER_REGISTER_TO ""
+ENV RUNNER_WORKDIR ""
+ENV RUNNER_LABELS ""
+ENV ADDITIONAL_PACKAGES ""
+ENV ADDITIONAL_FLAGS ""
+ENV GOPROXY ""
+
+RUN <<'~'
+  : install required dependencies
+  set -ex
+
+  apt-get update
+  apt-get -y install \
+    apt-transport-https \
+    apt-utils \
+    autoconf \
+    avahi-utils \
+    bash \
+    build-essential \
+    bzip2 \
+    ca-certificates \
+    clang \
+    chromium-browser \
+    cmake \
+    curl \
+    dirmngr \
+    dumb-init \
+    gcc \
+    gettext \
+    gettext \
+    git \
+    gnupg \
+    gosu \
+    gpg-agent \
+    inetutils-ping \
+    iproute2 \
+    jq \
+    libcurl4 \
+    libcurl4-openssl-dev \
+    libpq-dev \
+    locales \
+    make \
+    nodejs \
+    openssh-client \
+    perl \
+    psmisc \
+    python3 \
+    python3-dnslib \
+    python3-pip \
+    python3-setuptools \
+    rsync \
+    software-properties-common \
+    sudo \
+    tar \
+    unzip \
+    wget \
+    zip \
+    zlib1g \
+    zlib1g-dev \
+    zstd
+~
+
+RUN <<'~'
+  : install firefox and the geckodriver
+  apt-get update
+  apt-get install -y software-properties-common
+  add-apt-repository ppa:mozillateam/ppa
+  
+  # Create preferences to prioritize Mozilla PPA version over snap
+  cat <<! > /etc/apt/preferences.d/mozilla-firefox
+Package: *
+Pin: release o=LP-PPA-mozillateam
+Pin-Priority: 1001
+
+Package: firefox
+Pin: release o=Ubuntu
+Pin-Priority: -1
+!
+  apt-get update
+  apt-get -y install firefox-geckodriver
+~
+
+SHELL [ "/usr/bin/env", "-S", "bash", "-ex", "-o", "pipefail", "-c" ]
+ENV PS4="+ "
+
+# docker cli
+RUN <<'~'
+  : Install signing docker key
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  : Add the repository to Apt sources
+  cat <<! | cut -c 3- | tee /etc/apt/sources.list.d/docker.list
+  deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable
+!
+  : Install packages
+  apt-get -y update
+  apt-get -y install --no-install-recommends --allow-unauthenticated \
+    docker-ce-cli docker-buildx-plugin \
+    docker-compose-plugin containerd.io
+~
+
+RUN <<'~'
+  : Adding focal as packages source for fetching libssl1.1 required by the runner
+  sed -e "s/mantic/focal/g" </etc/apt/sources.list | tee /etc/apt/sources.list.d/focal.list
+  apt-get -y update
+~
+
+# add runner user
+RUN <<'~'
+  : "Add runner user:"
+
+  group:add() {
+    name=$1
+    id=$2
+    group=$( getent group | awk -F: "\$3 == $id { print }" )
+
+    if [[ -z "$group" ]]; then
+      groupadd -g $id $name
+    fi
+  }       
+
+  group:add docker 999
+  group:add podman 1000
+
+  useradd -mr -d /home/runner -u 1001 -G 999,1000,sudo runner
+
+  echo '%sudo ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+~
+
+
+FROM runner-os as docker-proxy-dns
+
+FROM runner-os as runner
+
+# Install runner's runtime from env stage
+COPY --from=env --chown=runner:runner /runner/ /home/runner/
+
+RUN <<'~'
+  bash -x -o pipefail /home/runner/bin/installdependencies.sh
+~
+
+RUN <<~
+  : add tools for debugging
+  apt-get install -y emacs-nox bind9-dnsutils lsof
+~
+
+# Systemd Resolved
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD /usr/local/bin/check-resolved.sh || exit 1
+
+COPY --chmod=644 <<'000-docker-proxy-dns.conf' /etc/systemd/resolved.conf.d/
+[Resolve]
+Cache=yes
+CacheFromLocalhost=yes
+DNS=127.53.0.53 8.8.8.8 1.1.1.1
+DNSSEC=no
+DNSStubListener=yes
+FallbackDNS=1.1.1.1
+000-docker-proxy-dns.conf
+
+COPY --chmod=755 <<'docker-proxy-dns' <<'relink-etc-resolv-conf' <<'check-resolved' /usr/local/sbin/
+#!/usr/bin/env python3
+
+import os
+import pdb
+import sys
+import json
+import select
+import socket
+import subprocess
+import threading
+
+from dnslib import DNSRecord, DNSHeader, DNSQuestion, QTYPE, RR, A
+
+SCRIPT_NAME = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+
+def get_all_networks():
+    try:
+        result = subprocess.run(['docker', 'network', 'ls', '--format', '{{.Name}}'], capture_output=True, text=True, check=True)
+        return result.stdout.strip().split('\n')
+    except subprocess.CalledProcessError as e:
+        print(f"Error listing Docker networks: {e}", file=sys.stderr)
+        return []
+
+def get_container_id():
+    # Try to get the HOSTNAME from environment variable
+    hostname = os.environ.get('HOSTNAME')
+    
+    # If HOSTNAME is not set in the environment, fall back to the hostname command
+    if not hostname:
+        try:
+            result = subprocess.run(['hostname'], capture_output=True, text=True, check=True)
+            hostname = result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            print(f"Error running hostname command: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Unexpected error getting hostname: {e}", file=sys.stderr)
+    
+    return hostname
+
+def get_container_networks(container_id):
+    try:
+        result = subprocess.run(['docker', 'container', 'inspect', '--format=json', container_id], capture_output=True, text=True)
+        container_info = json.loads(result.stdout)
+        if container_info and len(container_info) > 0:
+            networks = container_info[0].get('NetworkSettings', {}).get('Networks', {})
+            return networks
+        return {}
+    except Exception as e:
+        print(f"Error getting container networks: {e}", file=sys.stderr)
+        return {}
+
+def connect_to_networks(container_id):
+    all_networks = get_all_networks()
+    current_networks = get_container_networks(container_id)
+
+    for network in all_networks:
+        if network == 'bridge':
+            continue
+        if network not in current_networks:
+            try:
+                subprocess.run(['docker', 'network', 'connect', network, container_id], check=True)
+                print(f"Connected to network: {network}", file=sys.stderr)
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to connect to network {network}: {e}", file=sys.stderr)
+
+    # After connecting to new networks, get updated network info
+    return get_network_info(container_id)
+
+def get_network_info(container_id):
+    try:
+        # Get IP address information
+        addr_result = subprocess.run(['ip', '-j', 'addr'], capture_output=True, text=True)
+        ip_info = json.loads(addr_result.stdout)
+
+        # Get container networks
+        container_networks = get_container_networks(container_id)
+
+        network_info = {}
+        prefix = f"{SCRIPT_NAME}-"
+        
+        for interface in ip_info:
+            if interface['ifname'].startswith(prefix):
+                domain_prefix = interface['ifname'][len(prefix):]
+                for addr in interface['addr_info']:
+                    if addr['family'] == 'inet':
+                        ip_address = addr['local']
+                        prefixlen = addr['prefixlen']
+                        network = f"{ip_address.rsplit('.', 1)[0]}.0/{prefixlen}"
+                        dns_server = f"{ip_address.rsplit('.', 1)[0]}.1"
+                        
+                        network_info[interface['ifname']] = {
+                            'domain': f"{domain_prefix}.internal",
+                            'ip': ip_address,
+                            'network': network,
+                            'dns_server': dns_server
+                        }
+                        break
+                else:
+                    print(f"Warning: No IPv4 address found for {interface['ifname']}", file=sys.stderr)
+        
+        # Add container networks
+        for net_name, net_info in container_networks.items():
+            network_info[f"docker-{net_name}"] = {
+                'domain': f"{net_name.replace('compose_', '')}.internal",
+                'ip': net_info.get('IPAddress', '0.0.0.0'),
+                'network': net_info.get('NetworkID', ''),
+                'dns_server': net_info.get('Gateway', '')  # Docker's embedded DNS
+            }
+        
+        if not network_info:
+            print(f"No interfaces with prefix '{prefix}' or container networks found.", file=sys.stderr)
+        
+        return network_info
+    except Exception as e:
+        print(f"Error getting network info: {e}", file=sys.stderr)
+        return {}
+
+
+def forward_dns(request, server, port=53):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(5)  # Set a timeout of 5 seconds
+    try:
+        sock.sendto(request, (server, port))
+        data, _ = sock.recvfrom(1024)
+        return data
+    except socket.timeout:
+        print(f"Timeout while querying {server}:{port}", file=sys.stderr)
+        return None
+    finally:
+        sock.close()
+
+def handle_dns_request(data, addr, socket, network_info, default_dns, is_tcp=False):
+    try:
+        request = DNSRecord.parse(data)
+        qname = str(request.q.qname)
+        print(f"Received query for: {qname}", file=sys.stderr)
+
+        response = None  # Initialize response variable
+
+        for config in network_info.values():
+            domain_suffix = f".{config['domain']}."
+            if qname.endswith(domain_suffix):
+                # Strip the domain suffix for internal queries
+                stripped_qname = qname[:-len(domain_suffix)]
+                if not stripped_qname:
+                    stripped_qname = '@'  # Use @ for bare domain queries
+                print(f"Stripping domain, new query: {stripped_qname}", file=sys.stderr)
+
+                # Create a new request with the stripped name
+                new_request = DNSRecord(DNSHeader(id=request.header.id, qr=0, aa=0, ra=0),
+                                        q=DNSQuestion(stripped_qname, qtype=request.q.qtype))
+
+                print(f"Forwarding internal query to DNS: {stripped_qname} -> {config['dns_server']}", file=sys.stderr)
+                response_data = forward_dns(new_request.pack(), config['dns_server'])
+
+                if response_data:
+                    # Parse the response and modify it to use the original query name
+                    response = DNSRecord.parse(response_data)
+                    response.header.id = request.header.id
+                    response.questions[0].qname = request.q.qname
+                    for rr in response.rr:
+                        rr.rname = request.q.qname
+
+                    if not is_tcp:
+                        socket.sendto(response.pack(), addr)
+                    print(f"Prepared modified response for {qname}", file=sys.stderr)
+                else:
+                    print(f"No response received for {stripped_qname}", file=sys.stderr)
+                    # Prepare a failure response
+                    response = request.reply()
+                    response.header.rcode = 2  # SERVFAIL
+                break  # Exit the loop as we've handled the query
+
+        if response is None:
+            # If not an internal domain, forward to default DNS
+            print(f"Forwarding query to default DNS: {qname} -> {default_dns[0]}", file=sys.stderr)
+            response_data = forward_dns(data, default_dns[0])
+
+            if response_data:
+                response = DNSRecord.parse(response_data)
+                if not is_tcp:
+                    socket.sendto(response_data, addr)
+                print(f"Prepared response for {qname}", file=sys.stderr)
+            else:
+                print(f"No response received for {qname}", file=sys.stderr)
+                # Prepare a failure response
+                response = request.reply()
+                response.header.rcode = 2  # SERVFAIL
+
+        return response.pack() if response else None
+
+    except Exception as e:
+        print(f"Error handling request: {e}", file=sys.stderr)
+        return None
+        
+def get_default_dns():
+    try:
+        result = subprocess.run(['resolvectl', 'status'], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if line.strip().startswith('DNS Servers:'):
+                servers = line.split(':')[1].strip().split()
+                return [server for server in servers if server != '127.53.0.53']  # Exclude our own proxy
+        return ['8.8.8.8']  # Default to Google DNS if no servers found
+    except Exception as e:
+        print(f"Error getting default DNS: {e}", file=sys.stderr)
+        return ['8.8.8.8']  # Default to Google DNS in case of error
+
+def flush_dns_and_restart_resolved():
+    try:
+        print("Flushing DNS caches...", file=sys.stderr)
+        subprocess.run(['resolvectl', 'flush-caches'], check=True)
+        print("DNS caches flushed", file=sys.stderr)
+
+        print("Restarting systemd-resolved...", file=sys.stderr)
+        subprocess.run(['systemctl', 'restart', 'systemd-resolved'], check=True)
+        print("systemd-resolved restarted", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"Error flushing DNS or restarting systemd-resolved: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+
+def listen_to_dns_requests(network_info):
+    sockets = []
+    
+    # UDP sockets
+    sock_udp_loopback = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_udp_container = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    sock_udp_loopback.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock_udp_container.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    sock_udp_loopback.bind(('127.53.0.53', 53))
+    sock_udp_container.bind(('0.0.0.0', 53))
+    
+    sockets.extend([sock_udp_loopback, sock_udp_container])
+    
+    # TCP sockets for each discovered IP (excluding loopback)
+    for interface, config in network_info.items():
+        ip_address = config['ip']
+        if not ip_address.startswith('127.'):  # Exclude loopback addresses
+            try:
+                sock_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock_tcp.bind((ip_address, 53))
+                sock_tcp.listen(5)
+                sockets.append(sock_tcp)
+                print(f"Listening on TCP {ip_address}:53 for interface {interface}", file=sys.stderr)
+            except Exception as e:
+                print(f"Failed to bind TCP socket to {ip_address}:53 for interface {interface}: {e}", file=sys.stderr)
+    
+    return sockets
+
+
+def handle_tcp_connection(conn, addr, network_info, default_dns):
+    try:
+        while True:
+            # Read the length of the DNS message (first two bytes)
+            length_bytes = conn.recv(2)
+            if not length_bytes:
+                break
+            length = int.from_bytes(length_bytes, byteorder='big')
+            
+            # Read the actual DNS message
+            data = conn.recv(length)
+            if len(data) != length:
+                break
+            
+            # Process the DNS query
+            response = handle_dns_request(data, addr, conn, network_info, default_dns, is_tcp=True)
+            
+            if response:
+                # Send the response back
+                conn.sendall(len(response).to_bytes(2, byteorder='big') + response)
+            else:
+                print(f"Error: handle_dns_request returned None for TCP connection from {addr}", file=sys.stderr)
+                break
+    except Exception as e:
+        print(f"Error handling TCP connection from {addr}: {e}", file=sys.stderr)
+    finally:
+        conn.close()
+
+def main():
+    container_id = get_container_id()
+    if not container_id:
+        print("Failed to determine container ID", file=sys.stderr)
+        return
+
+    network_info = connect_to_networks(container_id)
+    if not network_info:
+        print("Failed to get network configuration. Exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    default_dns = get_default_dns()
+    print(f"Default DNS servers: {', '.join(default_dns)}", file=sys.stderr)
+
+    # Print network configuration
+    for net_name, net_config in network_info.items():
+        print(f"Network: {net_name}")
+        for key, value in net_config.items():
+            print(f"  {key}: {value}")
+
+    print("DNS Proxy running on 127.53.0.53:53 and discovered IP addresses", file=sys.stderr)
+    print("Configured interfaces and domains:", file=sys.stderr)
+    for interface, config in network_info.items():
+        print(f"  {interface}: {config['domain']} -> {config['ip']} (Network: {config['network']}, DNS: {config['dns_server']})", file=sys.stderr)
+
+    print("Listening for DNS requests", file=sys.stderr)
+    sockets = listen_to_dns_requests(network_info)
+
+    print("Flushing and restarting resolved", file=sys.stderr)
+    flush_dns_and_restart_resolved()
+
+    while True:
+        try:
+            # Use select to wait for data on any of the sockets
+            readable, _, _ = select.select(sockets, [], [])
+
+            for sock in readable:
+                if sock.type == socket.SOCK_DGRAM:
+                    # Handle UDP
+                    data, addr = sock.recvfrom(1024)
+                    handle_dns_request(data, addr, sock, network_info, default_dns)
+                elif sock.type == socket.SOCK_STREAM:
+                    # Handle TCP
+                    conn, addr = sock.accept()
+                    threading.Thread(target=handle_tcp_connection, args=(conn, addr, network_info, default_dns)).start()
+
+        except Exception as e:
+            print(f"Error in main loop: {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
+docker-proxy-dns
+#!/usr/bin/env -S bash -xe -o pipefail
+cp /etc/resolv.conf /etc/resolv.conf~container;
+umount /etc/resolv.conf || true; rm -f /etc/resolv.conf
+ln -fs /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+relink-etc-resolv-conf
+#!/usr/bin/env -S bash -e -o pipefail
+systemctl is-active --quiet systemd-resolved
+check-resolved
+
+COPY --chmod=644 <<'docker-proxy-dns.service' <<'relink-etc-resolv-conf.service' /etc/systemd/system/
+[Unit]
+Description=Custom DNS Proxy
+After=network.target
+
+[Service]
+Environment=DOCKER_HOST=tcp://host.containers.internal:2375
+ExecStart=/usr/local/sbin/docker-proxy-dns
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+docker-proxy-dns.service
+[Unit]
+Description=Re-link resolv.conf to resolved stub
+DefaultDependencies=no
+Before=sysinit.target local-fs.target
+ConditionPathExists=/etc/resolv.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/relink-etc-resolv-conf
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+relink-etc-resolv-conf.service
+
+# Systemd journactl configuration override
+
+COPY --chmod=644 <<'console' /etc/systemd/journald.conf.d/
+[Journal]
+ForwardToConsole=yes
+MaxLevelConsole=info
+console
+
+# Systemd GHA runner service
+
+COPY --chmod=644 <<'~' /etc/systemd/system/gha-runner.service
+[Unit]
+Description=GHA runner docker entrypoint
+After=network.target
+
+[Service]
+Type=simple
+User=runner
+ExecStart=/home/runner/entrypoint.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+~
+
+COPY --chmod=644 <<'~' /etc/systemd/system/gha-runner.service.d/override.conf
+[Service]
+Environment=SYSTEMD_IGNORE_CHROOT=1
+~
+
+RUN <<'~'
+  : Disable useless services
+  systemctl disable containerd
+  systemctl disable postfix
+  systemctl disable snapd
+
+  : Enable systemd-networkd
+  systemctl enable systemd-networkd
+  systemctl disable systemd-networkd-wait-online
+
+  : Enable systemd-resolved
+  systemctl enable systemd-resolved
+
+  : Enable relink-etc-resolv-conf
+  systemctl enable docker-proxy-dns
+  systemctl enable relink-etc-resolv-conf
+
+  : Enable gha-runner
+  systemctl enable gha-runner
+~
+
+# run as user
+USER runner
+WORKDIR /home/runner/
+
+# set mountpoints
+VOLUME /home/runner/.m2/repository
+VOLUME /home/runner/.m2/build-cache
+
+RUN <<~
+    : create mountpoints with the right permission
+    mkdir -p \
+      ~/.m2/repository  \
+      ~/.m2/build-cache
+~
+
+COPY --chown=runner:runner --chmod=755 <<'entrypoint.sh' <<'runsvc.sh' ./
+#!/usr/bin/env -S bash -ex -o pipefail
+
+env=( RUNNER_REGISTER_TO
+      RUNNER_WORKDIR
+      RUNNER_LABELS
+      ADDITIONAL_PACKAGES
+      ADDITIONAL_FLAGS
+      GOPROXY )
+
+set -a
+source <( sudo cat /proc/1/environ | tr '\0' '\n' | grep -E "$( IFS='|'; echo "^(${env[*]})=" )" )
+set +a
+
+cd ~runner
+
+:register:workdir() {
+  echo ${RUNNER_WORKDIR:-work}
+}
+
+:register:name() {
+  echo ${RUNNER_NAME:-runner}
+}
+
+:register:to() {
+  echo ${RUNNER_REGISTER_TO}
+}
+
+:register:labels() {
+  echo ${RUNNER_LABELS}
+}
+
+:kms:server:path() {
+  local service=$1
+  local path=${RUNNER_REGISTER_TO}/$service
+
+  if [[ "${RUNNER_REGISTER_TO}" == *\/* ]]; then
+    path=repo/${path}
+  fi
+
+  echo $path
+}
+
+:kms:register:token() {
+  curl -s http://gha-kms.gha.internal:3000/$( :kms:server:path registration-token)
+}
+
+:kms:remove:token() {
+  curl -s http://gha-kms.gha.internal:3000/$( :kms:server:path remove-token)
+}
+
+register() {
+    bash -x ./config.sh \
+      --name $( :register:name ) \
+      --work $( :register:workdir ) \
+      --unattended \
+      --disableupdate \
+      --url "https://github.com/$( :register:to )" \
+      --token $( :kms:register:token ) \
+      --labels "$( :register:labels )" \
+      ${ADDITIONAL_FLAGS} 
+}
+
+remove() {
+  bash -x ./config.sh remove --token "$( :kms:remove:token )"
+}
+
+register
+
+trap 'remove' EXIT
+
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+./runsvc.sh "$*" &
+
+wait $!
+entrypoint.sh
+#!/usr/bin/env -S bash -ex -o pipefail
+
+# convert SIGTERM signal to SIGINT
+# for more info on how to propagate SIGTERM to a child process see: http://veithen.github.io/2014/11/16/sigterm-propagation.html
+trap 'kill -INT $PID' TERM INT
+
+if [ -f ".path" ]; then
+    # configure
+    export PATH=`cat .path`
+    echo ".path=${PATH}"
+fi
+
+# insert anything to setup env when running as a service
+
+# run the host process which keep the listener alive
+./externals/node20/bin/node ./bin/RunnerService.js &
+PID=$!
+wait $PID
+trap - TERM INT
+    wait $PID
+runsvc.sh
+
+# Should run root for launching systemd and we start the runner as a systemd service
+
+#ENTRYPOINT ["/home/runner/entrypoint.sh"]
+USER root
+
+

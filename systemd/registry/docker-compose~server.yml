@@ -1,0 +1,21 @@
+
+services:
+
+  server:
+    build:
+      args:
+        DOCKER_BUILDKIT: 1
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    image: docker-registry/server
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/v2/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    hostname: server
+    restart: always
+    volumes:
+      - docker-registry:/var/lib/registry
+

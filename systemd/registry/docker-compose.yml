@@ -1,0 +1,48 @@
+services:
+
+  docker-registry:
+    extends:
+      file: docker-compose~server.yml
+      ports:
+        - "5000:5000"
+      service: server
+      volumes:
+      - docker-registry:/var/lib/registry
+    networks:
+      docker:
+        aliases:
+          - docker-registry.${INTERNAL_DNS_DOMAIN}
+      local:
+        aliases:
+          - docker-registry.${LOCAL_DNS_DOMAIN}
+        ipv4_address: 172.16.0.2  # Specify the desired IP here
+
+    restart: always
+
+  docker-registry-ssl-builder:
+    extends:
+      file: docker-compose~ssl-builder.yml
+      service: ssl-builder
+    networks:
+      docker:
+
+  docker-registry-ssl-internal-certs:
+    extends:
+      file: docker-compose~ssl-builder.yml
+      service: ssl-internal-certs
+    networks:
+      docker:
+
+  docker-registry-ssl-proxy:
+    extends:
+      file: docker-compose~ssl-proxy.yml
+      service: ssl-proxy
+    depends_on:
+      docker-registry:
+        condition: service_healthy
+    networks:
+      docker:
+
+volumes:
+  docker-registry: &local-volume
+    driver: local

@@ -1,0 +1,21 @@
+include:
+  - systemd/docker-compose.yml
+  - gha/docker-compose.yml
+
+networks:
+  default:
+    labels:
+      dns.domain: "default.${INTERNAL_DNS_DOMAIN:-internal}"
+  local:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.16.0.0/12
+          ip_range: 172.${LOCAL_NETWORK:-16}.0.0/24
+          gateway: 172.${LOCAL_NETWORK:-16}.0.1
+          aux_addresses:
+            docker-registry: 172.${LOCAL_NETWORK:-16}.0.2
+    labels:
+      dns-domain: "${LOCAL_DNS_DOMAIN:-local}"
+      local: true

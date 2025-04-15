@@ -1,0 +1,14 @@
+services:
+  ssl-proxy:
+    # Note : Only nginx:alpine supports bcrypt.
+    # If you don't need to use bcrypt, you can use a different tag.
+    # Ref. https://github.com/nginxinc/docker-nginx/issues/29
+    build:
+      args:
+        DOCKER_BUILDKIT: 1
+      context: .
+      dockerfile: Dockerfile
+      target: ssl-proxy
+    image: docker-registry/ssl-proxy
+    ports:
+      - "${REGISTRY_SSL_PORT:-443}:443"

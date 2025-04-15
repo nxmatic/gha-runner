@@ -1,0 +1,21 @@
+name: docker-registry
+services:
+
+  ssl-builder:
+    build:
+      args:
+        DOCKER_BUILDKIT: 1
+      context: .
+      dockerfile: Dockerfile
+      target: ssl-builder
+    image: docker-registry/ssl-builder
+
+  ssl-internal-certs:
+    build:
+      args:
+        DOCKER_BUILDKIT: 1
+      context: .
+      dockerfile: Dockerfile
+      target: ssl-internal-certs
+    image: docker-registry/ssl-internal-certs
+

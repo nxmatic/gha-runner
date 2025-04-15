@@ -1,0 +1,48 @@
+services:
+  desktop-novnc:
+    extends:
+      file: ./novnc.yml
+      service: novnc
+    image: ${DOWNSTREAM:-ghcr.io/nuxeo/nos}/desktop-novnc:${VERSION:-latest}
+    networks:
+      docker:
+        aliases:
+          - novnc.${INTERNAL_DNS_DOMAIN}
+          - novnc.${LOCAL_DNS_DOMAIN}
+
+  desktop-wine:
+    extends:
+      file: ./novnc.yml
+      service: novnc
+    image: ${DOWNSTREAM:-ghcr.io/nuxeo/nos}/desktop-wine:${VERSION:-latest}
+    networks:
+      docker:
+        aliases:
+          - wine.${INTERNAL_DNS_DOMAIN}
+          - wine.${LOCAL_DNS_DOMAIN}
+    volumes:
+      - desktop-wine-home:/home
+
+  desktop-zen:
+    extends:
+      file: ./novnc.yml
+      service: novnc
+    image: ${DOWNSTREAM:-ghcr.io/nuxeo/nos}/desktop-zen:${VERSION:-latest}
+    networks:
+      docker:
+        aliases:
+          - zen.${INTERNAL_DNS_DOMAIN}
+          - zen.${LOCAL_DNS_DOMAIN}
+    volumes:
+      - desktop-zen-home:/home
+
+networks:
+  docker:
+    labels:
+      dns-domain: docker.${INTERNAL_DNS_DOMAIN}
+
+volumes:
+  desktop-novnc-home:
+  desktop-wine-home:
+  desktop-zen-home:
+    

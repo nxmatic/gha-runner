@@ -1,0 +1,15 @@
+x-novnc: &novnc
+  image: ${DOWNSTREAM:-ghcr.io/nuxeo/nos}/desktop-novnc:${VERSION:-latest}
+  labels:
+    - "io.podman.systemd=always"
+  environment:
+    DISPLAY_WIDTH: 1728
+    DISPLAY_HEIGHT: 1117
+  stop_grace_period: 30s
+  stop_signal: SIGRTMIN+3
+  volumes:
+    - desktop-novnc-home:/home
+
+services:
+  novnc:
+    <<: *novnc
