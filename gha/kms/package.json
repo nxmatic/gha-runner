@@ -5,7 +5,7 @@
   "main": "index.js",
   "dependencies": {
     "axios": "^0.21.1",
-    "express": "^4.17.2"
+    "express": "^4.20.0"
   },
   "devDependencies": {},
   "scripts": {
